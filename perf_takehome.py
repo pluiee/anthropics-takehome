@@ -44,6 +44,8 @@ class KernelBuilder:
         self.scratch_debug = {}
         self.scratch_ptr = 0
         self.const_map = {}
+        # Temporary buffer that aggregates slots per engine
+        self.buffer = {}
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -54,6 +56,18 @@ class KernelBuilder:
         for engine, slot in slots:
             instrs.append({engine: [slot]})
         return instrs
+
+    def add_to_buffer(self, engine, slot):
+        if engine not in self.buffer:
+            self.buffer[engine] = []
+        if len(self.buffer[engine]) < SLOT_LIMITS[engine]:
+            self.buffer[engine].append(slot)
+            return True
+        return False
+    
+    def buffer_to_instrs(self):
+        self.instrs.append(self.buffer)
+        self.buffer = {}
 
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
@@ -137,7 +151,7 @@ class KernelBuilder:
         # Any debug engine instruction is ignored by the submission simulator
         self.add("debug", ("comment", "Starting loop"))
 
-        body = []  # array of slots
+        # body = []  # array of slots
 
         # Scalar scratch registers
         tmp_idx = self.alloc_scratch("tmp_idx")
@@ -153,45 +167,53 @@ class KernelBuilder:
                 i_const = self.scratch_const(i)
 
                 # idx = mem[inp_indices_p + i], val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_iaddr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("alu", ("+", tmp_vaddr, self.scratch["inp_values_p"], i_const)))
+                self.add_to_buffer("alu", ("+", tmp_iaddr, self.scratch["inp_indices_p"], i_const))
+                self.add_to_buffer("alu", ("+", tmp_vaddr, self.scratch["inp_values_p"], i_const))
 
-                body.append(("load", ("load", tmp_idx, tmp_iaddr)))
-                body.append(("load", ("load", tmp_val, tmp_vaddr)))
+                self.buffer_to_instrs()
 
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
+                self.add_to_buffer("load", ("load", tmp_idx, tmp_iaddr))
+                self.add_to_buffer("load", ("load", tmp_val, tmp_vaddr))
+
+                self.buffer_to_instrs()
+                
+                self.add("debug", ("compare", tmp_idx, (round, i, "idx")))
+                self.add("debug", ("compare", tmp_val, (round, i, "val")))
 
                 # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_naddr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_naddr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
+                self.add("alu", ("+", tmp_naddr, self.scratch["forest_values_p"], tmp_idx))
+                self.add("load", ("load", tmp_node_val, tmp_naddr))
+                self.add("debug", ("compare", tmp_node_val, (round, i, "node_val")))
 
                 # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
+                self.add("alu", ("^", tmp_val, tmp_val, tmp_node_val))
+                for instr in self.build_hash(tmp_val, tmp1, tmp2, round, i):
+                    self.add(*instr)
+                self.add("debug", ("compare", tmp_val, (round, i, "hashed_val")))
 
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("flow", ("select", tmp3, tmp1, two_const, one_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
+                self.add_to_buffer("alu", ("%", tmp1, tmp_val, two_const))
+                self.add_to_buffer("alu", ("*", tmp_idx, tmp_idx, two_const))
+                self.buffer_to_instrs()
+                self.add("flow", ("select", tmp3, tmp1, two_const, one_const))
+                self.add("alu", ("+", tmp_idx, tmp_idx, tmp3))
+                self.add("debug", ("compare", tmp_idx, (round, i, "next_idx")))
 
                 # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
+                self.add("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"]))
+                self.add("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const))
+                self.add("debug", ("compare", tmp_idx, (round, i, "wrapped_idx")))
 
                 # mem[inp_indices_p + i] = idx
-                body.append(("store", ("store", tmp_iaddr, tmp_idx)))
+                self.add_to_buffer("store", ("store", tmp_iaddr, tmp_idx))
 
                 # mem[inp_values_p + i] = val
-                body.append(("store", ("store", tmp_vaddr, tmp_val)))
+                self.add_to_buffer("store", ("store", tmp_vaddr, tmp_val))
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
+                self.buffer_to_instrs()
+
+        # body_instrs = self.build(body)
+        # self.instrs.extend(body_instrs)
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 
