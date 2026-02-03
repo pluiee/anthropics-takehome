@@ -181,7 +181,6 @@ class KernelBuilder:
     - Split `tmp_addr` to remove unnecessary repetitions. (139542)
     - Use `vload` for initial setup. (139529)
     - Remove unneccessary comparison during index update. (135433)
-    - Swap loop orders to reuse `i` based values. (120073)
     """
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
@@ -236,17 +235,17 @@ class KernelBuilder:
         tmp_vaddr = self.alloc_scratch("tmp_vaddr")
         tmp_naddr = self.alloc_scratch("tmp_naddr")
 
-        for i in range(batch_size):
-            i_const = self.scratch_const(i)
+        for round in range(rounds):
+            for i in range(batch_size):
+                i_const = self.scratch_const(i)
 
-            # idx = mem[inp_indices_p + i], val = mem[inp_values_p + i]
-            body.append(("alu", ("+", tmp_iaddr, self.scratch["inp_indices_p"], i_const)))
-            body.append(("alu", ("+", tmp_vaddr, self.scratch["inp_values_p"], i_const)))
+                # idx = mem[inp_indices_p + i], val = mem[inp_values_p + i]
+                body.append(("alu", ("+", tmp_iaddr, self.scratch["inp_indices_p"], i_const)))
+                body.append(("alu", ("+", tmp_vaddr, self.scratch["inp_values_p"], i_const)))
 
-            body.append(("load", ("load", tmp_idx, tmp_iaddr)))
-            body.append(("load", ("load", tmp_val, tmp_vaddr)))
+                body.append(("load", ("load", tmp_idx, tmp_iaddr)))
+                body.append(("load", ("load", tmp_val, tmp_vaddr)))
 
-            for round in range(rounds):
                 body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
                 body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
 
