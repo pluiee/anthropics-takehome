@@ -103,6 +103,7 @@ class KernelBuilder:
     - Remove unneccessary comparison during index update. (135433)
     - Aggregate independent instrs to buffer (119049)
     - Aggregate hash instrs (94473)
+    - Aggregate stores with next loads (90378)
     """
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
@@ -149,8 +150,6 @@ class KernelBuilder:
         self.add("flow", ("pause",))
         # Any debug engine instruction is ignored by the submission simulator
         self.add("debug", ("comment", "Starting loop"))
-
-        # body = []  # array of slots
 
         # Scalar scratch registers
         tmp_idx = self.alloc_scratch("tmp_idx")
@@ -208,10 +207,9 @@ class KernelBuilder:
                 # mem[inp_values_p + i] = val
                 self.add_to_buffer("store", ("store", tmp_vaddr, tmp_val))
 
-                self.buffer_to_instrs()
+                # self.buffer_to_instrs()
 
-        # body_instrs = self.build(body)
-        # self.instrs.extend(body_instrs)
+        self.buffer_to_instrs()
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 
