@@ -57,6 +57,7 @@ class KernelBuilder:
             instrs.append({engine: [slot]})
         return instrs
 
+    # TODO: Allow buffer to exceed slot limits and automatically pack them when flushing.
     def add_to_buffer(self, engine, slot):
         if engine not in self.buffer:
             self.buffer[engine] = []
@@ -65,7 +66,7 @@ class KernelBuilder:
             return
         raise Exception(f"{engine} is full") 
     
-    def buffer_to_instrs(self):
+    def flush_buffer(self):
         self.instrs.append(self.buffer)
         self.buffer = {}
 
@@ -81,10 +82,13 @@ class KernelBuilder:
         assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
         return addr
 
-    def scratch_const(self, val, name=None):
+    def scratch_const(self, val, name=None, buffered=False):
         if val not in self.const_map:
             addr = self.alloc_scratch(name)
-            self.add("load", ("const", addr, val))
+            if buffered:
+                self.add_to_buffer("load", ("const", addr, val))
+            else:
+                self.add("load", ("const", addr, val))
             self.const_map[val] = addr
         return self.const_map[val]
 
@@ -92,20 +96,21 @@ class KernelBuilder:
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             self.add_to_buffer("valu", (op1, tmp1, val_hash_addr, self.scratch[f"{val1}_vec"]))
             self.add_to_buffer("valu", (op3, tmp2, val_hash_addr, self.scratch[f"{val3}_vec"]))
-            self.buffer_to_instrs()
+            self.flush_buffer()
             self.add("valu", (op2, val_hash_addr, tmp1, tmp2))
             self.add("debug", ("vcompare", val_hash_addr, [(round, j, "hash_stage", hi) for j in range(i, i+VLEN)]))
     
     # Allocate vectors of hash-related constants to utilize vector instructions
     def init_hash_values(self):
         for (op1, val1, op2, op3, val3) in HASH_STAGES:
-            val1_const = self.scratch_const(val1)
-            val3_const = self.scratch_const(val3)
+            val1_const = self.scratch_const(val1, None, True)
+            val3_const = self.scratch_const(val3, None, True)
+            self.flush_buffer()
             val1_vec = self.alloc_scratch(f"{val1}_vec", VLEN)
             val3_vec = self.alloc_scratch(f"{val3}_vec", VLEN)
             self.add_to_buffer("valu", ("vbroadcast", val1_vec, val1_const))
             self.add_to_buffer("valu", ("vbroadcast", val3_vec, val3_const))
-            self.buffer_to_instrs()
+            self.flush_buffer()
 
     """
     - Baseline (147734)
@@ -117,6 +122,8 @@ class KernelBuilder:
     - Aggregate stores with next loads (90378)
     - Apply vector instructions (16658)
     - Switch loop order and reuse round-independent values (12338)
+    - Aggregate scratch_const operations (12210)
+    - Loop unrolling x 4 (7073)
     """
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
@@ -125,9 +132,11 @@ class KernelBuilder:
         Like reference_kernel2 but building actual instructions.
         Scalar implementation using only scalar ALU and load/store.
         """
-        tmp1 = self.alloc_scratch("tmp1", VLEN)
-        tmp2 = self.alloc_scratch("tmp2", VLEN)
-        tmp3 = self.alloc_scratch("tmp3", VLEN)
+        LOOP_UNROLL = 4 
+
+        tmp1 = [self.alloc_scratch(f"tmp1_{i}", VLEN) for i in range(LOOP_UNROLL)]
+        tmp2 = [self.alloc_scratch(f"tmp2_{i}", VLEN) for i in range(LOOP_UNROLL)]
+        tmp3 = [self.alloc_scratch(f"tmp3_{i}", VLEN) for i in range(LOOP_UNROLL)]
     
         # Scratch space addresses
         init_vars = [
@@ -149,8 +158,10 @@ class KernelBuilder:
         #     self.add("load", ("load", self.scratch[v], tmp1))
         
         # Load all const at once to make them adjacent in scratch space
-        for i in range(batch_size):
-            self.scratch_const(i)
+        for i in range(0, batch_size, SLOT_LIMITS["load"]):
+            for j in range(SLOT_LIMITS["load"]):
+                self.scratch_const(i+j, None, True)
+            self.flush_buffer()
         
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
@@ -165,13 +176,13 @@ class KernelBuilder:
         self.add("debug", ("comment", "Starting loop"))
 
         # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx", VLEN)
-        tmp_val = self.alloc_scratch("tmp_val", VLEN)
-        tmp_node_val = self.alloc_scratch("tmp_node_val", VLEN)
+        tmp_idx = [self.alloc_scratch(f"tmp_idx_{i}", VLEN) for i in range(LOOP_UNROLL)]
+        tmp_val = [self.alloc_scratch(f"tmp_val_{i}", VLEN) for i in range(LOOP_UNROLL)]
+        tmp_node_val = [self.alloc_scratch(f"tmp_node_val_{i}", VLEN) for i in range(LOOP_UNROLL)]
 
-        tmp_iaddr = self.alloc_scratch("tmp_iaddr", VLEN)
-        tmp_vaddr = self.alloc_scratch("tmp_vaddr", VLEN)
-        tmp_naddr = self.alloc_scratch("tmp_naddr", VLEN)
+        tmp_iaddr = [self.alloc_scratch(f"tmp_iaddr_{i}", VLEN) for i in range(LOOP_UNROLL)]
+        tmp_vaddr = [self.alloc_scratch(f"tmp_vaddr_{i}", VLEN) for i in range(LOOP_UNROLL)]
+        tmp_naddr = [self.alloc_scratch(f"tmp_naddr_{i}", VLEN) for i in range(LOOP_UNROLL)]
 
         indices_vec = self.alloc_scratch("indices_vec", VLEN)
         values_vec = self.alloc_scratch("values_vec", VLEN)
@@ -192,66 +203,117 @@ class KernelBuilder:
         self.add_to_buffer("valu", ("vbroadcast", values_vec, self.scratch["inp_values_p"] ))
         self.add_to_buffer("valu", ("vbroadcast", forest_values_vec, self.scratch["forest_values_p"]))
 
-        self.buffer_to_instrs()
+        self.flush_buffer()
 
         self.add("valu", ("vbroadcast", n_nodes_vec, self.scratch["n_nodes"]))
 
-        for i in range(0, batch_size, VLEN):
-            i_const = self.scratch_const(i)
+        for i in range(0, batch_size, VLEN*LOOP_UNROLL):
+            i_const = [self.scratch_const(i+VLEN*t) for t in range(LOOP_UNROLL)]
 
             # idx = mem[inp_indices_p + i], val = mem[inp_values_p + i]
-            self.add_to_buffer("valu", ("+", tmp_iaddr, indices_vec, i_const))
-            self.add_to_buffer("valu", ("+", tmp_vaddr, values_vec, i_const))
+            # LOOP_UNROLL <= SLOT_LIMITS["valu"] / 2
+            for t in range(LOOP_UNROLL):
+                self.add_to_buffer("valu", ("+", tmp_iaddr[t], indices_vec, i_const[t]))
+                self.add_to_buffer("valu", ("+", tmp_vaddr[t], values_vec, i_const[t]))
+                # TODO: Generalize
+                if t == 1:
+                    self.flush_buffer()
+            self.flush_buffer()
 
-            self.buffer_to_instrs()
-
-            for j in range(VLEN):
-                self.add_to_buffer("load", ("load_offset", tmp_idx, tmp_iaddr, j))
-                self.add_to_buffer("load", ("load_offset", tmp_val, tmp_vaddr, j))
-
-                self.buffer_to_instrs()
+            for t in range(LOOP_UNROLL):
+                for j in range(VLEN):
+                    self.add_to_buffer("load", ("load_offset", tmp_idx[t], tmp_iaddr[t], j))
+                    self.add_to_buffer("load", ("load_offset", tmp_val[t], tmp_vaddr[t], j))
+                    self.flush_buffer()
 
             for round in range(rounds):
-                self.add("debug", ("vcompare", tmp_idx, [(round, j, "idx") for j in range(i, i+VLEN)]))
-                self.add("debug", ("vcompare", tmp_val, [(round, j, "val") for j in range(i, i+VLEN)]))
+                for t in range(LOOP_UNROLL):
+                    self.add("debug", ("vcompare", tmp_idx[t], [(round, j, "idx") for j in range(i+VLEN*t, i+VLEN*t+VLEN)]))
+                    self.add("debug", ("vcompare", tmp_val[t], [(round, j, "val") for j in range(i+VLEN*t, i+VLEN*t+VLEN)]))
 
                 # node_val = mem[forest_values_p + idx]
-                self.add("valu", ("+", tmp_naddr, forest_values_vec, tmp_idx))
+                # LOOP_UNROLL <= SLOT_LIMTIS["valu"]
+                for t in range(LOOP_UNROLL):
+                    self.add_to_buffer("valu", ("+", tmp_naddr[t], forest_values_vec, tmp_idx[t]))
+                self.flush_buffer()
 
-                for j in range(0, VLEN, SLOT_LIMITS["load"]):
-                    for k in range(SLOT_LIMITS["load"]):
-                        self.add_to_buffer("load", ("load_offset", tmp_node_val, tmp_naddr, j + k))
-                    self.buffer_to_instrs()
+                for t in range(LOOP_UNROLL):
+                    for j in range(0, VLEN, SLOT_LIMITS["load"]):
+                        for k in range(SLOT_LIMITS["load"]):
+                            self.add_to_buffer("load", ("load_offset", tmp_node_val[t], tmp_naddr[t], j+k))
+                        self.flush_buffer()
 
-                self.add("debug", ("vcompare", tmp_node_val, [(round, j, "node_val") for j in range(i, i+VLEN)]))
+                for t in range(LOOP_UNROLL):
+                    self.add("debug", ("vcompare", tmp_node_val[t], [(round, j, "node_val") for j in range(i+VLEN*t, i+VLEN*t+VLEN)]))
 
                 # val = myhash(val ^ node_val)
-                self.add("valu", ("^", tmp_val, tmp_val, tmp_node_val))
-                self.add_hash(tmp_val, tmp1, tmp2, round, i)
-                self.add("debug", ("vcompare", tmp_val, [(round, j, "hashed_val") for j in range(i, i+VLEN)]))
+                # LOOP_UNROLL <= SLOT_LIMTIS["valu"]
+                for t in range(LOOP_UNROLL):
+                    self.add_to_buffer("valu", ("^", tmp_val[t], tmp_val[t], tmp_node_val[t]))
+                self.flush_buffer()
+
+                # self.add_hash(tmp_val[t], tmp1[t], tmp2[t], round, i + t*VLEN)
+                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                    for t in range(LOOP_UNROLL):
+                        self.add_to_buffer("valu", (op1, tmp1[t], tmp_val[t], self.scratch[f"{val1}_vec"]))
+                        self.add_to_buffer("valu", (op3, tmp2[t], tmp_val[t], self.scratch[f"{val3}_vec"]))
+                        # TODO: Generalize
+                        if t == 1:
+                            self.flush_buffer()
+                    self.flush_buffer()
+                    for t in range(LOOP_UNROLL):
+                        self.add_to_buffer("valu", (op2, tmp_val[t], tmp1[t], tmp2[t]))
+                    self.flush_buffer()
+                    for t in range(LOOP_UNROLL):
+                        self.add("debug", ("vcompare", tmp_val[t], [(round, j, "hash_stage", hi) for j in range(i+VLEN*t, i+VLEN*t+VLEN)]))
+
+
+                for t in range(LOOP_UNROLL):
+                    self.add("debug", ("vcompare", tmp_val[t], [(round, j, "hashed_val") for j in range(i+VLEN*t, i+VLEN*t+VLEN)]))
 
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                self.add_to_buffer("valu", ("%", tmp1, tmp_val, two_vec))
-                self.add_to_buffer("valu", ("*", tmp_idx, tmp_idx, two_vec))
-                self.buffer_to_instrs()
-                self.add("flow", ("vselect", tmp3, tmp1, two_vec, one_vec))
-                self.add("valu", ("+", tmp_idx, tmp_idx, tmp3))
-                self.add("debug", ("vcompare", tmp_idx, [(round, j, "next_idx") for j in range(i, i+VLEN)]))
+                # LOOP_UNROLL <= SLOT_LIMITS["valu"] / 2
+                for t in range(LOOP_UNROLL):
+                    self.add_to_buffer("valu", ("%", tmp1[t], tmp_val[t], two_vec))
+                    self.add_to_buffer("valu", ("*", tmp_idx[t], tmp_idx[t], two_vec))
+                    # TODO: Generalize
+                    if t == 1:
+                        self.flush_buffer()
+                self.flush_buffer()
+
+
+                for t in range(LOOP_UNROLL):
+                    self.add("flow", ("vselect", tmp3[t], tmp1[t], two_vec, one_vec))
+
+                # LOOP_UNROLL <= SLOT_LIMITS["valu"]
+                for t in range(LOOP_UNROLL):
+                    self.add_to_buffer("valu", ("+", tmp_idx[t], tmp_idx[t], tmp3[t]))
+                self.flush_buffer()
+
+                for t in range(LOOP_UNROLL):
+                    self.add("debug", ("vcompare", tmp_idx[t], [(round, j, "next_idx") for j in range(i+VLEN*t, i+VLEN*t+VLEN)]))
 
                 # idx = 0 if idx >= n_nodes else idx
-                self.add("valu", ("<", tmp1, tmp_idx, n_nodes_vec))
-                self.add("flow", ("vselect", tmp_idx, tmp1, tmp_idx, zero_vec))
-                self.add("debug", ("vcompare", tmp_idx, [(round, j, "wrapped_idx") for j in range(i, i+VLEN)]))
+                # LOOP_UNROLL <= SLOT_LIMITS["valu"]
+                for t in range(LOOP_UNROLL):
+                    self.add_to_buffer("valu", ("<", tmp1[t], tmp_idx[t], n_nodes_vec))
+                self.flush_buffer()
+
+                for t in range(LOOP_UNROLL):
+                    self.add("flow", ("vselect", tmp_idx[t], tmp1[t], tmp_idx[t], zero_vec))
+                    self.add("debug", ("vcompare", tmp_idx[t], [(round, j, "wrapped_idx") for j in range(i+VLEN*t, i+VLEN*t+VLEN)]))
 
                 # mem[inp_indices_p + i] = idx
-                self.add_to_buffer("store", ("vstore", tmp_iaddr, tmp_idx))
-
                 # mem[inp_values_p + i] = val
-                self.add_to_buffer("store", ("vstore", tmp_vaddr, tmp_val))
+                for t in range(LOOP_UNROLL):
+                    self.add_to_buffer("store", ("vstore", tmp_iaddr[t], tmp_idx[t]))
+                    self.add_to_buffer("store", ("vstore", tmp_vaddr[t], tmp_val[t]))
+                    # TODO: Pack store with next loop's load as we originally did before loop unrolling
+                    self.flush_buffer()
+                
+                # self.flush_buffer()
 
-                # self.buffer_to_instrs()
-
-        self.buffer_to_instrs()
+        # self.flush_buffer()
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 
