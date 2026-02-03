@@ -88,22 +88,21 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
-    def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
-        slots = []
-
+    def add_hash(self, val_hash_addr, tmp1, tmp2, round, i):
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
-            slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
-            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-            slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
-
-        return slots
+            self.add_to_buffer("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1)))
+            self.add_to_buffer("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3)))
+            self.buffer_to_instrs()
+            self.add("alu", (op2, val_hash_addr, tmp1, tmp2))
+            self.add("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi)))
 
     """
     - Baseline (147734)
     - Split `tmp_addr` to remove unnecessary repetitions. (139542)
     - Use `vload` for initial setup. (139529)
     - Remove unneccessary comparison during index update. (135433)
+    - Aggregate independent instrs to buffer (119049)
+    - Aggregate hash instrs (94473)
     """
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
@@ -187,8 +186,7 @@ class KernelBuilder:
 
                 # val = myhash(val ^ node_val)
                 self.add("alu", ("^", tmp_val, tmp_val, tmp_node_val))
-                for instr in self.build_hash(tmp_val, tmp1, tmp2, round, i):
-                    self.add(*instr)
+                self.add_hash(tmp_val, tmp1, tmp2, round, i)
                 self.add("debug", ("compare", tmp_val, (round, i, "hashed_val")))
 
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
