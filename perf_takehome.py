@@ -116,6 +116,7 @@ class KernelBuilder:
     - Aggregate hash instrs (94473)
     - Aggregate stores with next loads (90378)
     - Apply vector instructions (16658)
+    - Switch loop order and reuse round-independent values (12338)
     """
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
@@ -195,22 +196,22 @@ class KernelBuilder:
 
         self.add("valu", ("vbroadcast", n_nodes_vec, self.scratch["n_nodes"]))
 
-        for round in range(rounds):
-            for i in range(0, batch_size, VLEN):
-                i_const = self.scratch_const(i)
+        for i in range(0, batch_size, VLEN):
+            i_const = self.scratch_const(i)
 
-                # idx = mem[inp_indices_p + i], val = mem[inp_values_p + i]
-                self.add_to_buffer("valu", ("+", tmp_iaddr, indices_vec, i_const))
-                self.add_to_buffer("valu", ("+", tmp_vaddr, values_vec, i_const))
+            # idx = mem[inp_indices_p + i], val = mem[inp_values_p + i]
+            self.add_to_buffer("valu", ("+", tmp_iaddr, indices_vec, i_const))
+            self.add_to_buffer("valu", ("+", tmp_vaddr, values_vec, i_const))
+
+            self.buffer_to_instrs()
+
+            for j in range(VLEN):
+                self.add_to_buffer("load", ("load_offset", tmp_idx, tmp_iaddr, j))
+                self.add_to_buffer("load", ("load_offset", tmp_val, tmp_vaddr, j))
 
                 self.buffer_to_instrs()
 
-                for j in range(VLEN):
-                    self.add_to_buffer("load", ("load_offset", tmp_idx, tmp_iaddr, j))
-                    self.add_to_buffer("load", ("load_offset", tmp_val, tmp_vaddr, j))
-
-                    self.buffer_to_instrs()
-                
+            for round in range(rounds):
                 self.add("debug", ("vcompare", tmp_idx, [(round, j, "idx") for j in range(i, i+VLEN)]))
                 self.add("debug", ("vcompare", tmp_val, [(round, j, "val") for j in range(i, i+VLEN)]))
 
