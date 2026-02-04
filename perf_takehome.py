@@ -124,6 +124,7 @@ class KernelBuilder:
     - Switch loop order and reuse round-independent values (12338)
     - Aggregate scratch_const operations (12210)
     - Loop unrolling x 4 (7073)
+    - Apply vload and trivial pipelines (6457)
     """
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
@@ -215,16 +216,14 @@ class KernelBuilder:
             for t in range(LOOP_UNROLL):
                 self.add_to_buffer("valu", ("+", tmp_iaddr[t], indices_vec, i_const[t]))
                 self.add_to_buffer("valu", ("+", tmp_vaddr[t], values_vec, i_const[t]))
-                # TODO: Generalize
-                if t == 1:
-                    self.flush_buffer()
-            self.flush_buffer()
+                if t > 0:
+                    self.add_to_buffer("load", ("vload", tmp_idx[t-1], tmp_iaddr[t-1]))
+                    self.add_to_buffer("load", ("vload", tmp_val[t-1], tmp_vaddr[t-1]))
+                self.flush_buffer()
 
-            for t in range(LOOP_UNROLL):
-                for j in range(VLEN):
-                    self.add_to_buffer("load", ("load_offset", tmp_idx[t], tmp_iaddr[t], j))
-                    self.add_to_buffer("load", ("load_offset", tmp_val[t], tmp_vaddr[t], j))
-                    self.flush_buffer()
+            self.add_to_buffer("load", ("vload", tmp_idx[-1], tmp_iaddr[-1]))
+            self.add_to_buffer("load", ("vload", tmp_val[-1], tmp_vaddr[-1]))
+            self.flush_buffer()
 
             for round in range(rounds):
                 for t in range(LOOP_UNROLL):
@@ -300,18 +299,18 @@ class KernelBuilder:
                 self.flush_buffer()
 
                 for t in range(LOOP_UNROLL):
-                    self.add("flow", ("vselect", tmp_idx[t], tmp1[t], tmp_idx[t], zero_vec))
+                    self.add_to_buffer("flow", ("vselect", tmp_idx[t], tmp1[t], tmp_idx[t], zero_vec))
+                    # mem[inp_indices_p + i] = idx
+                    # mem[inp_values_p + i] = val
+                    if t > 0:
+                        self.add_to_buffer("store", ("vstore", tmp_iaddr[t-1], tmp_idx[t-1]))
+                        self.add_to_buffer("store", ("vstore", tmp_vaddr[t-1], tmp_val[t-1]))
+                    self.flush_buffer()
                     self.add("debug", ("vcompare", tmp_idx[t], [(round, j, "wrapped_idx") for j in range(i+VLEN*t, i+VLEN*t+VLEN)]))
 
-                # mem[inp_indices_p + i] = idx
-                # mem[inp_values_p + i] = val
-                for t in range(LOOP_UNROLL):
-                    self.add_to_buffer("store", ("vstore", tmp_iaddr[t], tmp_idx[t]))
-                    self.add_to_buffer("store", ("vstore", tmp_vaddr[t], tmp_val[t]))
-                    # TODO: Pack store with next loop's load as we originally did before loop unrolling
-                    self.flush_buffer()
-                
-                # self.flush_buffer()
+                self.add_to_buffer("store", ("vstore", tmp_iaddr[-1], tmp_idx[-1]))
+                self.add_to_buffer("store", ("vstore", tmp_vaddr[-1], tmp_val[-1]))
+                self.flush_buffer() 
 
         # self.flush_buffer()
         # Required to match with the yield in reference_kernel2
