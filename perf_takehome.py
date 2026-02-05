@@ -125,6 +125,7 @@ class KernelBuilder:
     - Aggregate scratch_const operations (12210)
     - Loop unrolling x 4 (7073)
     - Apply vload and trivial pipelines (6457)
+    - Pack load_offsets with hashing valus (5689)
     """
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
@@ -237,37 +238,75 @@ class KernelBuilder:
                 self.flush_buffer()
 
                 for t in range(LOOP_UNROLL):
-                    for j in range(0, VLEN, SLOT_LIMITS["load"]):
-                        for k in range(SLOT_LIMITS["load"]):
-                            self.add_to_buffer("load", ("load_offset", tmp_node_val[t], tmp_naddr[t], j+k))
-                        self.flush_buffer()
+                    if t == 0:
+                        for j in range(0, VLEN, SLOT_LIMITS["load"]):
+                            for k in range(SLOT_LIMITS["load"]):
+                                self.add_to_buffer("load", ("load_offset", tmp_node_val[t], tmp_naddr[t], j+k))
+                            self.flush_buffer()
 
-                for t in range(LOOP_UNROLL):
                     self.add("debug", ("vcompare", tmp_node_val[t], [(round, j, "node_val") for j in range(i+VLEN*t, i+VLEN*t+VLEN)]))
 
-                # val = myhash(val ^ node_val)
-                # LOOP_UNROLL <= SLOT_LIMTIS["valu"]
-                for t in range(LOOP_UNROLL):
-                    self.add_to_buffer("valu", ("^", tmp_val[t], tmp_val[t], tmp_node_val[t]))
-                self.flush_buffer()
+                    # val = myhash(val ^ node_val)
+                    if t == 0:
+                        self.add_to_buffer("valu", ("^", tmp_val[t], tmp_val[t], tmp_node_val[t]))
+                        self.flush_buffer()
 
-                # self.add_hash(tmp_val[t], tmp1[t], tmp2[t], round, i + t*VLEN)
-                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                    for t in range(LOOP_UNROLL):
-                        self.add_to_buffer("valu", (op1, tmp1[t], tmp_val[t], self.scratch[f"{val1}_vec"]))
-                        self.add_to_buffer("valu", (op3, tmp2[t], tmp_val[t], self.scratch[f"{val3}_vec"]))
-                        # TODO: Generalize
-                        if t == 1:
+                    # self.add_hash(tmp_val[t], tmp1[t], tmp2[t], round, i + t*VLEN)
+                    # t = 0: Hash for t = 0 and load tmp_val[1], [2], [3]
+                    # t = 1: Calculate all leftover cases
+                    # t = 2, 3: Pass since there are no load or hashing left
+                    for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                        if t == 0:
+                        # tmp_node_val[1] is ready
+                            if hi == 2:
+                                self.add_to_buffer("valu", ("^", tmp_val[1], tmp_val[1], tmp_node_val[1])) 
+                            # tmp_node_val[2] is ready
+                            if hi == 4:
+                                self.add_to_buffer("valu", ("^", tmp_val[2], tmp_val[2], tmp_node_val[2]))
+                            self.add_to_buffer("valu", (op1, tmp1[t], tmp_val[t], self.scratch[f"{val1}_vec"]))
+                            self.add_to_buffer("valu", (op3, tmp2[t], tmp_val[t], self.scratch[f"{val3}_vec"]))
+                            if hi < 2:
+                                self.add_to_buffer("load", ("load_offset", tmp_node_val[1], tmp_naddr[1], 4*hi))
+                                self.add_to_buffer("load", ("load_offset", tmp_node_val[1], tmp_naddr[1], 4*hi+1))
+                            if hi >= 2 and hi < 4:
+                                self.add_to_buffer("load", ("load_offset", tmp_node_val[2], tmp_naddr[2], 4*(hi-2)))
+                                self.add_to_buffer("load", ("load_offset", tmp_node_val[2], tmp_naddr[2], 4*(hi-2)+1))
+                            if hi >= 4:
+                                self.add_to_buffer("load", ("load_offset", tmp_node_val[3], tmp_naddr[3], 4*(hi-4)))
+                                self.add_to_buffer("load", ("load_offset", tmp_node_val[3], tmp_naddr[3], 4*(hi-4)+1))
                             self.flush_buffer()
-                    self.flush_buffer()
-                    for t in range(LOOP_UNROLL):
-                        self.add_to_buffer("valu", (op2, tmp_val[t], tmp1[t], tmp2[t]))
-                    self.flush_buffer()
-                    for t in range(LOOP_UNROLL):
-                        self.add("debug", ("vcompare", tmp_val[t], [(round, j, "hash_stage", hi) for j in range(i+VLEN*t, i+VLEN*t+VLEN)]))
+                            self.add_to_buffer("valu", (op2, tmp_val[t], tmp1[t], tmp2[t]))
+                            if hi < 2:
+                                self.add_to_buffer("load", ("load_offset", tmp_node_val[1], tmp_naddr[1], 4*hi+2))
+                                self.add_to_buffer("load", ("load_offset", tmp_node_val[1], tmp_naddr[1], 4*hi+3))
+                            if hi >= 2 and hi < 4:
+                                self.add_to_buffer("load", ("load_offset", tmp_node_val[2], tmp_naddr[2], 4*(hi-2)+2))
+                                self.add_to_buffer("load", ("load_offset", tmp_node_val[2], tmp_naddr[2], 4*(hi-2)+3))
+                            if hi >= 4:
+                                self.add_to_buffer("load", ("load_offset", tmp_node_val[3], tmp_naddr[3], 4*(hi-4)+2))
+                                self.add_to_buffer("load", ("load_offset", tmp_node_val[3], tmp_naddr[3], 4*(hi-4)+3))
+                            self.flush_buffer()
+                        
+                        # Note that all tmp_node_vals are ready
+                        elif t == 1:
+                            for k in range(1, 4):
+                                self.add_to_buffer("valu", (op1, tmp1[k], tmp_val[k], self.scratch[f"{val1}_vec"]))
+                                self.add_to_buffer("valu", (op3, tmp2[k], tmp_val[k], self.scratch[f"{val3}_vec"]))
+                            self.flush_buffer()
+                            for k in range(1, 4):
+                                self.add_to_buffer("valu", (op2, tmp_val[k], tmp1[k], tmp2[k]))
+                            self.flush_buffer()
+                            for k in range(1, 4): 
+                                self.add("debug", ("vcompare", tmp_val[k], [(round, j, "hash_stage", hi) for j in range(i+VLEN*k, i+VLEN*k+VLEN)]))
+                        
+                        else:
+                            pass
+                    
+                    if t == 0:
+                        # tmp_node_val[3] is ready
+                        self.add_to_buffer("valu", ("^", tmp_val[3], tmp_val[3], tmp_node_val[3]))
+                        self.flush_buffer()
 
-
-                for t in range(LOOP_UNROLL):
                     self.add("debug", ("vcompare", tmp_val[t], [(round, j, "hashed_val") for j in range(i+VLEN*t, i+VLEN*t+VLEN)]))
 
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
@@ -275,14 +314,12 @@ class KernelBuilder:
                 for t in range(LOOP_UNROLL):
                     self.add_to_buffer("valu", ("%", tmp1[t], tmp_val[t], two_vec))
                     self.add_to_buffer("valu", ("*", tmp_idx[t], tmp_idx[t], two_vec))
-                    # TODO: Generalize
-                    if t == 1:
-                        self.flush_buffer()
+                    if t > 0:
+                        self.add_to_buffer("flow", ("vselect", tmp3[t-1], tmp1[t-1], two_vec, one_vec))
+                    self.flush_buffer()
+                
+                self.add_to_buffer("flow", ("vselect", tmp3[-1], tmp1[-1], two_vec, one_vec))
                 self.flush_buffer()
-
-
-                for t in range(LOOP_UNROLL):
-                    self.add("flow", ("vselect", tmp3[t], tmp1[t], two_vec, one_vec))
 
                 # LOOP_UNROLL <= SLOT_LIMITS["valu"]
                 for t in range(LOOP_UNROLL):
