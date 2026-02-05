@@ -127,6 +127,7 @@ class KernelBuilder:
     - Apply vload and trivial pipelines (6457)
     - Pack load_offsets with hashing valus (5689)
     - Use multiply_add for next_idx calculation (5305)
+    - Only store after all rounds end (4825)
     """
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
@@ -139,7 +140,6 @@ class KernelBuilder:
 
         tmp1 = [self.alloc_scratch(f"tmp1_{i}", VLEN) for i in range(LOOP_UNROLL)]
         tmp2 = [self.alloc_scratch(f"tmp2_{i}", VLEN) for i in range(LOOP_UNROLL)]
-        tmp3 = [self.alloc_scratch(f"tmp3_{i}", VLEN) for i in range(LOOP_UNROLL)]
     
         # Scratch space addresses
         init_vars = [
@@ -309,6 +309,7 @@ class KernelBuilder:
                     self.add("debug", ("vcompare", tmp_val[t], [(round, j, "hashed_val") for j in range(i+VLEN*t, i+VLEN*t+VLEN)]))
 
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
+                # Calculated as idx = 2*idx + 1 + (val % 2)
                 for t in range(LOOP_UNROLL):
                     self.add_to_buffer("valu", ("%", tmp1[t], tmp_val[t], two_vec))
                 self.flush_buffer()
@@ -325,23 +326,23 @@ class KernelBuilder:
                     self.add("debug", ("vcompare", tmp_idx[t], [(round, j, "next_idx") for j in range(i+VLEN*t, i+VLEN*t+VLEN)]))
 
                 # idx = 0 if idx >= n_nodes else idx
+                # Calculated as idx = idx * (idx < n_nodes)
                 for t in range(LOOP_UNROLL):
                     self.add_to_buffer("valu", ("<", tmp1[t], tmp_idx[t], n_nodes_vec))
                 self.flush_buffer()
 
                 for t in range(LOOP_UNROLL):
-                    self.add_to_buffer("flow", ("vselect", tmp_idx[t], tmp1[t], tmp_idx[t], zero_vec))
-                    # mem[inp_indices_p + i] = idx
-                    # mem[inp_values_p + i] = val
-                    if t > 0:
-                        self.add_to_buffer("store", ("vstore", tmp_iaddr[t-1], tmp_idx[t-1]))
-                        self.add_to_buffer("store", ("vstore", tmp_vaddr[t-1], tmp_val[t-1]))
-                    self.flush_buffer()
-                    self.add("debug", ("vcompare", tmp_idx[t], [(round, j, "wrapped_idx") for j in range(i+VLEN*t, i+VLEN*t+VLEN)]))
+                    self.add_to_buffer("valu", ("*", tmp_idx[t], tmp1[t], tmp_idx[t]))
+                self.flush_buffer()
 
-                self.add_to_buffer("store", ("vstore", tmp_iaddr[-1], tmp_idx[-1]))
-                self.add_to_buffer("store", ("vstore", tmp_vaddr[-1], tmp_val[-1]))
-                self.flush_buffer() 
+                for t in range(LOOP_UNROLL):
+                    self.add("debug", ("vcompare", tmp_idx[t], [(round, j, "wrapped_idx") for j in range(i+VLEN*t, i+VLEN*t+VLEN)]))
+                
+            # mem[inp_indices_p + i] = idx, mem[inp_values_p + i] = val
+            for t in range(LOOP_UNROLL):
+                self.add_to_buffer("store", ("vstore", tmp_iaddr[t], tmp_idx[t]))
+                self.add_to_buffer("store", ("vstore", tmp_vaddr[t], tmp_val[t]))
+                self.flush_buffer()
 
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
