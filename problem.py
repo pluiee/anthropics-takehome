@@ -362,6 +362,13 @@ class Machine:
         }
         self.scratch_write = {}
         self.mem_write = {}
+
+        for name, slots in instr.items():
+            if name == "debug":
+                continue
+            print(f"{name}: {len(slots)} / {SLOT_LIMITS[name]}")
+        print("===========")
+        
         for name, slots in instr.items():
             if name == "debug":
                 if not self.enable_debug:

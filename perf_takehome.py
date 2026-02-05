@@ -126,6 +126,7 @@ class KernelBuilder:
     - Loop unrolling x 4 (7073)
     - Apply vload and trivial pipelines (6457)
     - Pack load_offsets with hashing valus (5689)
+    - Use multiply_add for next_idx calculation (5305)
     """
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
@@ -213,7 +214,6 @@ class KernelBuilder:
             i_const = [self.scratch_const(i+VLEN*t) for t in range(LOOP_UNROLL)]
 
             # idx = mem[inp_indices_p + i], val = mem[inp_values_p + i]
-            # LOOP_UNROLL <= SLOT_LIMITS["valu"] / 2
             for t in range(LOOP_UNROLL):
                 self.add_to_buffer("valu", ("+", tmp_iaddr[t], indices_vec, i_const[t]))
                 self.add_to_buffer("valu", ("+", tmp_vaddr[t], values_vec, i_const[t]))
@@ -232,7 +232,6 @@ class KernelBuilder:
                     self.add("debug", ("vcompare", tmp_val[t], [(round, j, "val") for j in range(i+VLEN*t, i+VLEN*t+VLEN)]))
 
                 # node_val = mem[forest_values_p + idx]
-                # LOOP_UNROLL <= SLOT_LIMTIS["valu"]
                 for t in range(LOOP_UNROLL):
                     self.add_to_buffer("valu", ("+", tmp_naddr[t], forest_values_vec, tmp_idx[t]))
                 self.flush_buffer()
@@ -310,27 +309,22 @@ class KernelBuilder:
                     self.add("debug", ("vcompare", tmp_val[t], [(round, j, "hashed_val") for j in range(i+VLEN*t, i+VLEN*t+VLEN)]))
 
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                # LOOP_UNROLL <= SLOT_LIMITS["valu"] / 2
                 for t in range(LOOP_UNROLL):
                     self.add_to_buffer("valu", ("%", tmp1[t], tmp_val[t], two_vec))
-                    self.add_to_buffer("valu", ("*", tmp_idx[t], tmp_idx[t], two_vec))
-                    if t > 0:
-                        self.add_to_buffer("flow", ("vselect", tmp3[t-1], tmp1[t-1], two_vec, one_vec))
-                    self.flush_buffer()
-                
-                self.add_to_buffer("flow", ("vselect", tmp3[-1], tmp1[-1], two_vec, one_vec))
                 self.flush_buffer()
 
-                # LOOP_UNROLL <= SLOT_LIMITS["valu"]
                 for t in range(LOOP_UNROLL):
-                    self.add_to_buffer("valu", ("+", tmp_idx[t], tmp_idx[t], tmp3[t]))
+                    self.add_to_buffer("valu", ("+", tmp1[t], tmp1[t], one_vec))
+                self.flush_buffer()
+
+                for t in range(LOOP_UNROLL):
+                    self.add_to_buffer("valu", ("multiply_add", tmp_idx[t], tmp_idx[t], two_vec, tmp1[t]))
                 self.flush_buffer()
 
                 for t in range(LOOP_UNROLL):
                     self.add("debug", ("vcompare", tmp_idx[t], [(round, j, "next_idx") for j in range(i+VLEN*t, i+VLEN*t+VLEN)]))
 
                 # idx = 0 if idx >= n_nodes else idx
-                # LOOP_UNROLL <= SLOT_LIMITS["valu"]
                 for t in range(LOOP_UNROLL):
                     self.add_to_buffer("valu", ("<", tmp1[t], tmp_idx[t], n_nodes_vec))
                 self.flush_buffer()
@@ -349,7 +343,6 @@ class KernelBuilder:
                 self.add_to_buffer("store", ("vstore", tmp_vaddr[-1], tmp_val[-1]))
                 self.flush_buffer() 
 
-        # self.flush_buffer()
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 
