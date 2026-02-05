@@ -16,7 +16,6 @@ anything in the tests/ folder.
 We recommend you look through problem.py next.
 """
 
-from collections import defaultdict
 import random
 import unittest
 
@@ -50,25 +49,41 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Simple slot packing that just uses one slot per instruction bundle
-        instrs = []
-        for engine, slot in slots:
-            instrs.append({engine: [slot]})
-        return instrs
+    # def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
+    #     # Simple slot packing that just uses one slot per instruction bundle
+    #     instrs = []
+    #     for engine, slot in slots:
+    #         instrs.append({engine: [slot]})
+    #     return instrs
 
-    # TODO: Allow buffer to exceed slot limits and automatically pack them when flushing.
     def add_to_buffer(self, engine, slot):
         if engine not in self.buffer:
             self.buffer[engine] = []
-        if len(self.buffer[engine]) < SLOT_LIMITS[engine]:
-            self.buffer[engine].append(slot)
-            return
-        raise Exception(f"{engine} is full") 
+        self.buffer[engine].append(slot)
     
     def flush_buffer(self):
-        self.instrs.append(self.buffer)
-        self.buffer = {}
+        instrs = []
+        
+        while True:
+            current_instr = {}
+            has_data = False
+            
+            for engine, slots in self.buffer.items():
+                if not slots:
+                    continue
+            
+                has_data = True
+                max_len = SLOT_LIMITS[engine]
+                
+                current_instr[engine] = slots[:max_len]
+                self.buffer[engine] = slots[max_len:]
+            
+            if not has_data:
+                break
+            
+            instrs.append(current_instr)
+        
+        self.instrs.extend(instrs) 
 
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
