@@ -19,6 +19,7 @@ We recommend you look through problem.py next.
 - 147734: Baseline
 - 21794: Use vector instructions
 - 17954: Load and store only once
+- 17442: Use multiply_add
 """
 
 from collections import defaultdict
@@ -196,9 +197,8 @@ class KernelBuilder:
                 body.append(("debug", ("vcompare", tmp_val, [(round, i+j, "hashed_val") for j in range(VLEN)])))
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
                 body.append(("valu", ("%", tmp1, tmp_val, two_const_v)))
-                body.append(("valu", ("*", tmp_idx, tmp_idx, two_const_v)))
+                body.append(("valu", ("multiply_add", tmp_idx, tmp_idx, two_const_v, one_const_v)))
                 body.append(("valu", ("+", tmp_idx, tmp_idx, tmp1)))
-                body.append(("valu", ("+", tmp_idx, tmp_idx, one_const_v)))
                 body.append(("debug", ("vcompare", tmp_idx, [(round, i+j, "next_idx") for j in range(VLEN)])))
                 # idx = 0 if idx >= n_nodes else idx
                 body.append(("valu", ("<", tmp1, tmp_idx, n_nodes_v)))
