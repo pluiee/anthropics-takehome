@@ -18,6 +18,7 @@ We recommend you look through problem.py next.
 # Updates
 - 147734: Baseline
 - 21794: Use vector instructions
+- 17954: Load and store only once
 """
 
 from collections import defaultdict
@@ -172,16 +173,17 @@ class KernelBuilder:
 
         body = []  # array of slots
 
-        for round in range(rounds):
-            for i in range(0, batch_size, VLEN):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(("valu", ("+", tmp_idx_addr, inp_indices_p_v, i_const)))
-                body.append(("load", ("vload", tmp_idx, tmp_idx_addr)))
+        for i in range(0, batch_size, VLEN):
+            i_const = self.scratch_const(i)
+            # idx = mem[inp_indices_p + i]
+            body.append(("valu", ("+", tmp_idx_addr, inp_indices_p_v, i_const)))
+            body.append(("load", ("vload", tmp_idx, tmp_idx_addr)))
+            # val = mem[inp_values_p + i]
+            body.append(("valu", ("+", tmp_val_addr, inp_values_p_v, i_const)))
+            body.append(("load", ("vload", tmp_val, tmp_val_addr)))
+
+            for round in range(rounds):
                 body.append(("debug", ("vcompare", tmp_idx, [(round, i+j, "idx") for j in range(VLEN)])))
-                # val = mem[inp_values_p + i]
-                body.append(("valu", ("+", tmp_val_addr, inp_values_p_v, i_const)))
-                body.append(("load", ("vload", tmp_val, tmp_val_addr)))
                 body.append(("debug", ("vcompare", tmp_val, [(round, i+j, "val") for j in range(VLEN)])))
                 # node_val = mem[forest_values_p + idx]
                 body.append(("valu", ("+", tmp_node_addr, forest_values_p_v, tmp_idx)))
@@ -202,12 +204,13 @@ class KernelBuilder:
                 body.append(("valu", ("<", tmp1, tmp_idx, n_nodes_v)))
                 body.append(("valu", ("*", tmp_idx, tmp_idx, tmp1)))
                 body.append(("debug", ("vcompare", tmp_idx, [(round, i+j, "wrapped_idx") for j in range(VLEN)])))
-                # mem[inp_indices_p + i] = idx
-                body.append(("valu", ("+", tmp_idx_addr, inp_indices_p_v, i_const)))
-                body.append(("store", ("vstore", tmp_idx_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("valu", ("+", tmp_val_addr, inp_values_p_v, i_const)))
-                body.append(("store", ("vstore", tmp_val_addr, tmp_val)))
+
+            # mem[inp_indices_p + i] = idx
+            body.append(("valu", ("+", tmp_idx_addr, inp_indices_p_v, i_const)))
+            body.append(("store", ("vstore", tmp_idx_addr, tmp_idx)))
+            # mem[inp_values_p + i] = val
+            body.append(("valu", ("+", tmp_val_addr, inp_values_p_v, i_const)))
+            body.append(("store", ("vstore", tmp_val_addr, tmp_val)))
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
