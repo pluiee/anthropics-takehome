@@ -20,6 +20,7 @@ We recommend you look through problem.py next.
 - 21794: Use vector instructions
 - 17954: Load and store only once
 - 17442: Use multiply_add
+- Allocate independent scratch space per chunk
 """
 
 from collections import defaultdict
@@ -170,54 +171,57 @@ class KernelBuilder:
         # Any debug engine instruction is ignored by the submission simulator
         self.add("debug", ("comment", "Starting loop"))
 
-        tmp1 = self.alloc_scratch("tmp1", VLEN)
-        tmp2 = self.alloc_scratch("tmp2", VLEN)
-        tmp_idx = self.alloc_scratch("tmp_idx", VLEN)
-        tmp_val = self.alloc_scratch("tmp_val", VLEN)
-        tmp_node_val = self.alloc_scratch("tmp_node_val", VLEN)
-        tmp_idx_addr = self.alloc_scratch("tmp_idx_addr", VLEN)
-        tmp_val_addr = self.alloc_scratch("tmp_val_addr", VLEN)
-        tmp_node_addr = self.alloc_scratch("tmp_node_addr", VLEN)
+        chunk_size = batch_size // VLEN
+
+        tmp1 = [self.alloc_scratch(f"tmp1_{i}", VLEN) for i in range(chunk_size)]
+        tmp2 = [self.alloc_scratch(f"tmp2_{i}", VLEN) for i in range(chunk_size)]
+        tmp_idx = [self.alloc_scratch(f"tmp_idx_{i}", VLEN) for i in range(chunk_size)]
+        tmp_val = [self.alloc_scratch(f"tmp_val_{i}", VLEN) for i in range(chunk_size)]
+
+        # Use tmp1 and tmp2 instead to match SCRATCH_SIZE while allocating independent scratch space for each chunk.
+        # tmp_node_val = [self.alloc_scratch(f"tmp_node_val_{i}", VLEN) for i in range(chunk_size)]
+        # tmp_addr = [self.alloc_scratch(f"tmp_idx_addr_{i}", VLEN) for i in range(chunk_size)]
 
         body = []  # array of slots
 
         for i in range(0, batch_size, VLEN):
+            chunk_i = i // VLEN
             i_const = self.scratch_const(i)
             # idx = mem[inp_indices_p + i]
-            body.append(("valu", ("+", tmp_idx_addr, inp_indices_p_v, i_const)))
-            body.append(("load", ("vload", tmp_idx, tmp_idx_addr)))
+            body.append(("valu", ("+", tmp1[chunk_i], inp_indices_p_v, i_const)))
+            body.append(("load", ("vload", tmp_idx[chunk_i], tmp1[chunk_i])))
             # val = mem[inp_values_p + i]
-            body.append(("valu", ("+", tmp_val_addr, inp_values_p_v, i_const)))
-            body.append(("load", ("vload", tmp_val, tmp_val_addr)))
+            body.append(("valu", ("+", tmp2[chunk_i], inp_values_p_v, i_const)))
+            body.append(("load", ("vload", tmp_val[chunk_i], tmp2[chunk_i])))
 
             for round in range(rounds):
-                body.append(("debug", ("vcompare", tmp_idx, [(round, i+j, "idx") for j in range(VLEN)])))
-                body.append(("debug", ("vcompare", tmp_val, [(round, i+j, "val") for j in range(VLEN)])))
+                body.append(("debug", ("vcompare", tmp_idx[chunk_i], [(round, i+j, "idx") for j in range(VLEN)])))
+                body.append(("debug", ("vcompare", tmp_val[chunk_i], [(round, i+j, "val") for j in range(VLEN)])))
                 # node_val = mem[forest_values_p + idx]
-                body.append(("valu", ("+", tmp_node_addr, forest_values_p_v, tmp_idx)))
+                body.append(("valu", ("+", tmp1[chunk_i], forest_values_p_v, tmp_idx[chunk_i])))
                 for j in range(VLEN):
-                    body.append(("load", ("load_offset", tmp_node_val, tmp_node_addr, j)))
-                body.append(("debug", ("vcompare", tmp_node_val, [(round, i+j, "node_val") for j in range(VLEN)])))
+                    body.append(("load", ("load_offset", tmp2[chunk_i], tmp1[chunk_i], j)))
+                body.append(("debug", ("vcompare", tmp2[chunk_i], [(round, i+j, "node_val") for j in range(VLEN)])))
                 # val = myhash(val ^ node_val)
-                body.append(("valu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("vcompare", tmp_val, [(round, i+j, "hashed_val") for j in range(VLEN)])))
+                body.append(("valu", ("^", tmp_val[chunk_i], tmp_val[chunk_i], tmp2[chunk_i])))
+                body.extend(self.build_hash(tmp_val[chunk_i], tmp1[chunk_i], tmp2[chunk_i], round, i))
+                body.append(("debug", ("vcompare", tmp_val[chunk_i], [(round, i+j, "hashed_val") for j in range(VLEN)])))
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("valu", ("%", tmp1, tmp_val, two_const_v)))
-                body.append(("valu", ("multiply_add", tmp_idx, tmp_idx, two_const_v, one_const_v)))
-                body.append(("valu", ("+", tmp_idx, tmp_idx, tmp1)))
-                body.append(("debug", ("vcompare", tmp_idx, [(round, i+j, "next_idx") for j in range(VLEN)])))
+                body.append(("valu", ("%", tmp1[chunk_i], tmp_val[chunk_i], two_const_v)))
+                body.append(("valu", ("multiply_add", tmp_idx[chunk_i], tmp_idx[chunk_i], two_const_v, one_const_v)))
+                body.append(("valu", ("+", tmp_idx[chunk_i], tmp_idx[chunk_i], tmp1[chunk_i])))
+                body.append(("debug", ("vcompare", tmp_idx[chunk_i], [(round, i+j, "next_idx") for j in range(VLEN)])))
                 # idx = 0 if idx >= n_nodes else idx
-                body.append(("valu", ("<", tmp1, tmp_idx, n_nodes_v)))
-                body.append(("valu", ("*", tmp_idx, tmp_idx, tmp1)))
-                body.append(("debug", ("vcompare", tmp_idx, [(round, i+j, "wrapped_idx") for j in range(VLEN)])))
+                body.append(("valu", ("<", tmp1[chunk_i], tmp_idx[chunk_i], n_nodes_v)))
+                body.append(("valu", ("*", tmp_idx[chunk_i], tmp_idx[chunk_i], tmp1[chunk_i])))
+                body.append(("debug", ("vcompare", tmp_idx[chunk_i], [(round, i+j, "wrapped_idx") for j in range(VLEN)])))
 
             # mem[inp_indices_p + i] = idx
-            body.append(("valu", ("+", tmp_idx_addr, inp_indices_p_v, i_const)))
-            body.append(("store", ("vstore", tmp_idx_addr, tmp_idx)))
+            body.append(("valu", ("+", tmp1[chunk_i], inp_indices_p_v, i_const)))
+            body.append(("store", ("vstore", tmp1[chunk_i], tmp_idx[chunk_i])))
             # mem[inp_values_p + i] = val
-            body.append(("valu", ("+", tmp_val_addr, inp_values_p_v, i_const)))
-            body.append(("store", ("vstore", tmp_val_addr, tmp_val)))
+            body.append(("valu", ("+", tmp2[chunk_i], inp_values_p_v, i_const)))
+            body.append(("store", ("vstore", tmp2[chunk_i], tmp_val[chunk_i])))
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
