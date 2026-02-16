@@ -21,9 +21,11 @@ We recommend you look through problem.py next.
 - 17954: Load and store only once
 - 17442: Use multiply_add
 - Allocate independent scratch space per chunk
+- 2633: VLIW scheduling
 """
 
 from collections import defaultdict
+from scheduler import schedule_vliw
 import random
 import unittest
 
@@ -62,12 +64,7 @@ class KernelBuilder:
             for engine, slot in slots:
                 instrs.append({engine: [slot]})
             return instrs
-        return self.build_vliw(slots)
-
-    def build_vliw(self, slots: list[tuple[Engine, tuple]]):
-        instrs = []
-        # TODO: Pack instructions based on slot dependencies
-        return instrs
+        return schedule_vliw(slots)
 
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
@@ -223,7 +220,7 @@ class KernelBuilder:
             body.append(("valu", ("+", tmp2[chunk_i], inp_values_p_v, i_const)))
             body.append(("store", ("vstore", tmp2[chunk_i], tmp_val[chunk_i])))
 
-        body_instrs = self.build(body)
+        body_instrs = self.build(body, True)
         self.instrs.extend(body_instrs)
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
